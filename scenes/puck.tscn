@@ -1,0 +1,6 @@
+[gd_scene format=3 uid="uid://ciipo0qq1r8xf"]
+
+[ext_resource type="Script" uid="uid://dkdw3aw4vqvrd" path="res://scripts/puck.gd" id="1_gj0yh"]
+
+[node name="Puck" type="Node2D" unique_id=1927225989]
+script = ExtResource("1_gj0yh")

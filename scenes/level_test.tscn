@@ -1,0 +1,22 @@
+[gd_scene format=3 uid="uid://b7mw55ojc11vb"]
+
+[ext_resource type="PackedScene" uid="uid://b1djhum1scxoj" path="res://scenes/menu.tscn" id="1_d5kir"]
+[ext_resource type="Script" uid="uid://b7barvlwrngaj" path="res://scripts/main.gd" id="1_plvai"]
+[ext_resource type="Texture2D" uid="uid://sorn3ld573kj" path="res://assets/field2.png" id="2_plvai"]
+[ext_resource type="PackedScene" uid="uid://ciipo0qq1r8xf" path="res://scenes/puck.tscn" id="5_vkcgd"]
+
+[node name="LevelTest" type="Node2D" unique_id=1071841938]
+script = ExtResource("1_plvai")
+
+[node name="Sprite2D" type="Sprite2D" parent="." unique_id=182541247]
+texture = ExtResource("2_plvai")
+offset = Vector2(160, 320)
+
+[node name="Menu" parent="." unique_id=1462353990 instance=ExtResource("1_d5kir")]
+
+[node name="Players" type="Node2D" parent="." unique_id=1784084797]
+
+[node name="MultiplayerSpawner" type="MultiplayerSpawner" parent="." unique_id=1904977768]
+spawn_path = NodePath("../Players")
+
+[node name="Puck" parent="." unique_id=1927225989 instance=ExtResource("5_vkcgd")]
