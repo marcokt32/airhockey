@@ -13,11 +13,15 @@ config_version=5
 config/name="AirHockey"
 run/main_scene="uid://b7mw55ojc11vb"
 config/features=PackedStringArray("4.7", "Forward Plus")
-config/icon="res://icon.svg"
+config/icon="uid://c7hcj6j8quulk"
+config/windows_native_icon="res://icon.ico"
 
 [autoload]
 
 Net="*uid://dguw3colabp1k"
+Firebase="*uid://4onf1n4yvlco"
+PlayGames="*uid://my3yj2x47tav"
+GodotPlayGameServices="*uid://16a2qcoxnujc"
 
 [display]
 
@@ -27,12 +31,19 @@ window/stretch/mode="canvas_items"
 window/stretch/aspect="keep_width"
 window/handheld/orientation=1
 
+[editor]
+
+run/main_run_args="player_1,player_2"
+
+[editor_plugins]
+
+enabled=PackedStringArray("res://addons/GodotPlayGameServices/plugin.cfg")
+
 [physics]
 
 3d/physics_engine="Jolt Physics"
 
 [rendering]
 
-textures/canvas_textures/default_texture_filter=0
 rendering_device/driver.windows="d3d12"
 textures/vram_compression/import_etc2_astc=true

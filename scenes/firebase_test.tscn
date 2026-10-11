@@ -1,0 +1,6 @@
+[gd_scene format=3 uid="uid://bmlo3tjjidxiw"]
+
+[ext_resource type="Script" uid="uid://d0ul4fcap5bng" path="res://scripts/firebase_test.gd" id="1_kygrm"]
+
+[node name="FirebaseTest" type="Node" unique_id=1701937479]
+script = ExtResource("1_kygrm")

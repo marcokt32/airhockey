@@ -1,3 +1,20 @@
-# Godot 4+ specific ignores
+# Cache do Godot (gerado pelo editor)
 .godot/
+
+# Chave do Firebase (não versionar)
+firebase_config.cfg
+
+# Segredos e assinatura
+firebase_config.cfg
+*.keystore
+*.jks
+
+# Binários e builds
+*.apk
+*.aab
+*.idsig
+apk android/
+apk windows/
+android/build/.gradle/
+android/build/build/
 /android/

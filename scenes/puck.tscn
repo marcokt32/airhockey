@@ -1,6 +1,15 @@
 [gd_scene format=3 uid="uid://ciipo0qq1r8xf"]
 
 [ext_resource type="Script" uid="uid://dkdw3aw4vqvrd" path="res://scripts/puck.gd" id="1_gj0yh"]
+[ext_resource type="Texture2D" uid="uid://bctvljstft3nq" path="res://assets/puck.png" id="2_c1wug"]
 
 [node name="Puck" type="Node2D" unique_id=1927225989]
 script = ExtResource("1_gj0yh")
+max_speed = 1500.0
+friction = 0.8
+wall_bounce = 1.1
+min_hit_speed = 300.0
+
+[node name="Sprite2D" type="Sprite2D" parent="." unique_id=696337064]
+scale = Vector2(0.18666667, 0.18666668)
+texture = ExtResource("2_c1wug")

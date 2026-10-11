@@ -1,6 +1,16 @@
 [gd_scene format=3 uid="uid://b1djhum1scxoj"]
 
 [ext_resource type="Script" uid="uid://bmt04jydxuei7" path="res://scripts/menu.gd" id="1_yqeox"]
+[ext_resource type="FontFile" uid="uid://cha4yq4vp2oau" path="res://assets/fonts/Sports World-Regular.otf" id="2_con2f"]
+[ext_resource type="FontFile" uid="uid://bgbtxk4e7xu6h" path="res://assets/fonts/digital_display.ttf" id="3_4ytvr"]
+[ext_resource type="FontFile" uid="uid://bd7o3hkxbvha" path="res://assets/fonts/Isometra-Regular.ttf" id="4_4ytvr"]
+[ext_resource type="Texture2D" uid="uid://bl35kr0i2ybld" path="res://assets/menutileart.png" id="4_mhnvy"]
 
 [node name="Menu" type="CanvasLayer" unique_id=1462353990]
 script = ExtResource("1_yqeox")
+game_font = ExtResource("2_con2f")
+header_number_font = ExtResource("3_4ytvr")
+header_number_size = 36
+info_font = ExtResource("4_4ytvr")
+title_art = ExtResource("4_mhnvy")
+title_art_height = null
