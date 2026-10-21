@@ -7,6 +7,7 @@ extends Node
 
 const PATH_THEME := "res://audio/theme.ogg"                 # música tema (loop)
 const PATH_WALL := "res://audio/wall.wav"                   # disco na parede
+const PATH_HIT := "res://audio/hit.wav"                     # taco bate no disco
 const PATH_WHISTLE_START := "res://audio/whistle_start.wav" # apito de início
 const PATH_WHISTLE_END := "res://audio/whistle_end.wav"     # apito de fim
 const PATH_CROWD := "res://audio/crowd.ogg"                 # torcida no gol
@@ -16,13 +17,19 @@ const MUSIC_DB_MENU := -10.0     # música no menu
 const MUSIC_DB_MATCH := -17.0    # música durante a partida (deixa os efeitos aparecerem)
 const WALL_DB_SOFT := -14.0      # batida fraca na parede
 const WALL_DB_HARD := -3.0       # batida forte
+const HIT_DB_SOFT := -16.0       # toque leve do taco
+const HIT_DB_HARD := -5.0        # tacada forte
 const WHISTLE_DB := -2.0
 const CROWD_DB := -3.0
 
 # Vibração
-const WALL_BUZZ_MS := 15         # parede: curtíssima...
-const WALL_BUZZ_MIN := 0.10      # ...e fraca (amplitude 0..1)
-const WALL_BUZZ_MAX := 0.28
+const WALL_BUZZ_MS := 22         # parede: curta, mas já dá para sentir...
+const WALL_BUZZ_MIN := 0.16      # ...(amplitude 0..1)
+const WALL_BUZZ_MAX := 0.45
+const HIT_BUZZ_MS := 12          # taco no disco: ainda mais sutil que a parede
+const HIT_BUZZ_MIN := 0.08
+const HIT_BUZZ_MAX := 0.20
+const HIT_BUZZ_MIN_IMPACT := 80.0     # toques mais leves que isso (px/s) não vibram
 const WALL_BUZZ_MIN_IMPACT := 120.0   # batidas mais fracas que isso (px/s) não vibram
 const GOAL_BUZZ_MS := 220        # gol: bem mais evidente
 const GOAL_BUZZ_AMP := 1.0
@@ -36,12 +43,15 @@ static var _inst: GameAudio
 
 var _music: AudioStreamPlayer
 var _wall: AudioStreamPlayer
+var _hit: AudioStreamPlayer
 var _whistle_start: AudioStreamPlayer
 var _whistle_end: AudioStreamPlayer
 var _crowd: AudioStreamPlayer
 var _music_tween: Tween
 var _last_wall_ms := 0
 var _last_buzz_ms := 0
+var _last_hit_ms := 0
+var _last_hit_buzz_ms := 0
 var _in_match := false
 
 # ---------------------------------------------------------------- API estática
@@ -61,6 +71,11 @@ static func _ready_inst() -> bool:
 static func wall(impact: float) -> void:
 	if _ready_inst():
 		_inst._on_wall(impact)
+
+## Taco bateu no disco. impact = velocidade de aproximação (px/s); mine = foi o meu taco (só ele vibra).
+static func hit(impact: float, mine: bool) -> void:
+	if _ready_inst():
+		_inst._on_hit(impact, mine)
 
 static func goal() -> void:
 	if not _ready_inst():
@@ -93,6 +108,7 @@ func _ready() -> void:
 	process_mode = Node.PROCESS_MODE_ALWAYS
 	_music = _make_player(PATH_THEME, MUSIC_DB_MATCH if _in_match else MUSIC_DB_MENU, true)
 	_wall = _make_player(PATH_WALL, WALL_DB_SOFT, false, 4)   # até 4 batidas sobrepostas
+	_hit = _make_player(PATH_HIT, HIT_DB_SOFT, false, 4)
 	_whistle_start = _make_player(PATH_WHISTLE_START, WHISTLE_DB)
 	_whistle_end = _make_player(PATH_WHISTLE_END, WHISTLE_DB)
 	_crowd = _make_player(PATH_CROWD, CROWD_DB)
@@ -129,6 +145,18 @@ func _on_wall(impact: float) -> void:
 	if impact >= WALL_BUZZ_MIN_IMPACT and now - _last_buzz_ms > 90:
 		_last_buzz_ms = now
 		vibrate(WALL_BUZZ_MS, lerpf(WALL_BUZZ_MIN, WALL_BUZZ_MAX, k))
+
+func _on_hit(impact: float, mine: bool) -> void:
+	var now := Time.get_ticks_msec()
+	var k := clampf(impact / 700.0, 0.0, 1.0)
+	if sfx_enabled and _hit.stream != null and now - _last_hit_ms > 45:
+		_last_hit_ms = now
+		_hit.volume_db = lerpf(HIT_DB_SOFT, HIT_DB_HARD, k)
+		_hit.pitch_scale = randf_range(0.95, 1.05)
+		_hit.play()
+	if mine and impact >= HIT_BUZZ_MIN_IMPACT and now - _last_hit_buzz_ms > 90:
+		_last_hit_buzz_ms = now
+		vibrate(HIT_BUZZ_MS, lerpf(HIT_BUZZ_MIN, HIT_BUZZ_MAX, k))
 
 func _fade_music(in_match: bool) -> void:
 	_in_match = in_match

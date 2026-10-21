@@ -27,26 +27,16 @@ const QUICK_FALLBACK_MSG_S := 2.0  # quanto tempo mostrar "iniciando com CPU"
 const QUICK_MAX_TRIES := 3
 const QUEUE_STALE_S := 45.0        # entrada da fila mais velha que isso = host sumiu
 const QUEUE_CLEAN_S := 120.0       # entradas bem velhas são apagadas da fila
-# Servidor TURN (Metered). O jogador escolhe a região no menu.
-const TURN_USER := "f166f5b8c6f7073eec70868e"
-const TURN_PASS := "h8Oe05iFOn5Zeq5T"
-const TURN_GLOBAL := "global.relay.metered.ca"
-# [nome mostrado no menu, hostname]. O primeiro é o padrão.
-# Hostnames conforme a lista oficial do Metered (metered.ca/docs/turnserver-guides/turnserver-regions).
-# Obs.: regiões específicas são de planos pagos; no plano gratuito vale o "Padrão".
-const TURN_REGIONS := [
-	["Automático (recomendado)", "global.relay.metered.ca"],
-	["Padrão (plano gratuito)", "standard.relay.metered.ca"],
-	["América do Norte", "na.relay.metered.ca"],
-	["EUA - Leste", "us-east.relay.metered.ca"],
-	["EUA - Centro", "us-central.relay.metered.ca"],
-	["EUA - Oeste", "us-west.relay.metered.ca"],
-	["Canadá", "ca.relay.metered.ca"],
-	["Europa", "europe.relay.metered.ca"],
-	["Reino Unido", "uk.relay.metered.ca"],
-	["Espanha", "es.relay.metered.ca"],
-	["Ásia", "asia.relay.metered.ca"],
-	["Oceânia", "oceania.relay.metered.ca"],
+# Servidor TURN: Cloudflare Realtime TURN. As credenciais são temporárias e vêm de
+# um Worker nosso (cloudflare_turn_worker.js); o token da Cloudflare NUNCA fica no app.
+const TURN_ENDPOINT := "https://airhockey-turn.quintelamarco94.workers.dev/ice"   # <- troque pela URL do seu Worker
+const TURN_TTL_S := 86400            # validade pedida das credenciais (segundos)
+const TURN_REFRESH_S := 21600.0      # pede de novo se a cópia local for mais velha que isso
+const TURN_FETCH_TIMEOUT := 6.0
+# Se o Worker não responder: só STUN (conecta quando os NATs permitem; sem relay)
+const FALLBACK_ICE := [
+	{"urls": "stun:stun.cloudflare.com:3478"},
+	{"urls": "stun:stun.l.google.com:19302"},
 ]
 
 signal status_changed(text: String)
@@ -76,8 +66,10 @@ var _send_fail := 0   # junto das outras variáveis; zere também em _reset_flag
 var player_name := ""   # vazio = sem nome personalizado
 var vs_cpu := false      # partida contra a CPU (sem rede)
 var cpu_level := 1       # 0 fácil, 1 normal, 2 difícil
-var turn_host: String = TURN_REGIONS[0][1]   # o menu altera isso
-var _dns_cache := {}
+var rival_uid := ""      # uid (Firebase) do rival na sala WebRTC; "" = desconhecido (conquistas Meu freguês / Vingança)
+var _ice_cache: Array = []       # iceServers vindos do Worker (com credenciais temporárias)
+var _ice_fetched_at := 0.0       # segundos (ticks) de quando _ice_cache foi obtido
+var _ice_fetching := false
 
 # --- jogo rápido ---
 var _quick_id := 0              # sobe a cada leave(): cancela buscas antigas
@@ -90,7 +82,7 @@ var _conn_failed := false
 var rtt_ms := -1.0       # ping suavizado; -1 = sem medida
 var jitter_ms := 0.0
 var loss_pct := 0.0
-var turn_in_use := ""    # hostname TURN realmente usado (pode ser o global, por fallback)
+var turn_in_use := ""    # texto para o diagnóstico: "Cloudflare" ou "sem TURN (só STUN)"
 var _last_rtt := -1.0
 var _ping_clock := 0.0
 var _ping_seq := 0
@@ -158,6 +150,9 @@ func _host_room_impl(code: String, quick: bool) -> bool:
 		_tell("Falha no login do Firebase", quick)
 		return false
 	var sid := _session
+	await _ensure_ice()   # a conexão com o rival é criada depois, já com TURN pronto
+	if sid != _session:
+		return false
 	var info := {"host": Firebase.uid, "ts": Firebase.SERVER_TS}
 	# Cria só se a sala NÃO existir (atômico: dois jogadores não criam o mesmo código)
 	var r: Dictionary = await Firebase.db_create("rooms/" + code, info)
@@ -249,7 +244,11 @@ func _join_room_impl(code: String, quick: bool) -> bool:
 	if r.data.has("guest"):
 		_tell("Sala %s já está cheia" % code, quick)
 		return false
+	var host_uid := str(r.data["host"])
 
+	await _ensure_ice()
+	if sid != _session:
+		return false
 	_rtc_peer = WebRTCMultiplayerPeer.new()
 	var err := _rtc_peer.create_client(2)
 	if err != OK:
@@ -262,6 +261,7 @@ func _join_room_impl(code: String, quick: bool) -> bool:
 		return false
 	_room = code
 	_is_host = false
+	rival_uid = host_uid
 	_rtc_peer.add_peer(_conn, 1)
 	multiplayer.multiplayer_peer = _rtc_peer
 	_watch_ids.append(Firebase.watch(_room_path("offer"), _on_offer_changed, POLL_INTERVAL))
@@ -325,6 +325,7 @@ func _watch_guest() -> void:
 func _on_guest_changed(value: Variant) -> void:
 	if not _is_host or _conn != null or not (value is Dictionary):
 		return
+	rival_uid = str(value.get("uid", ""))
 	_conn = _make_connection()
 	if _conn == null:
 		return
@@ -385,27 +386,89 @@ func _on_offer_changed(value: Variant) -> void:
 # ------------------------------------------------------ comum aos dois
 
 func _ice_servers() -> Array:
-	var host := turn_host
-	if not _host_resolves(host):
-		push_warning("TURN %s não resolveu; usando global" % host)
-		status_changed.emit("Servidor %s indisponível, usando global" % host.get_slice(".", 0))
-		host = TURN_GLOBAL
-	turn_in_use = host
-	var turn := func(url: String) -> Dictionary:
-		return {"urls": url, "username": TURN_USER, "credential": TURN_PASS}
-	return [
-		{"urls": "stun:stun.relay.metered.ca:80"},
-		turn.call("turn:%s:80" % host),
-		turn.call("turn:%s:80?transport=tcp" % host),
-		turn.call("turn:%s:443" % host),
-		turn.call("turns:%s:443?transport=tcp" % host),
-	]
+	if _ice_cache.is_empty():
+		turn_in_use = "sem TURN (só STUN)"
+		return FALLBACK_ICE.duplicate(true)
+	turn_in_use = "Cloudflare"
+	return _ice_cache
 
-# Confere se o hostname existe (evita ficar sem TURN por região errada)
-func _host_resolves(host: String) -> bool:
-	if not _dns_cache.has(host):
-		_dns_cache[host] = IP.resolve_hostname(host, IP.TYPE_IPV4) != ""
-	return _dns_cache[host]
+## Pré-carrega as credenciais TURN (o menu chama ao abrir "Jogar online").
+func prefetch_ice() -> void:
+	_ensure_ice()
+
+## Garante credenciais TURN válidas antes de montar a conexão. Se já tem uma cópia
+## recente, volta na hora. Se o Worker falhar, mantém a cópia antiga (ou cai para STUN).
+func _ensure_ice() -> void:
+	if not _ice_cache.is_empty() and _now_s() - _ice_fetched_at < TURN_REFRESH_S:
+		return
+	if _ice_fetching:
+		while _ice_fetching:
+			await get_tree().process_frame
+		return
+	_ice_fetching = true
+	var servers: Array = await _fetch_ice()
+	_ice_fetching = false
+	if servers.is_empty():
+		push_warning("TURN: não consegui credenciais da Cloudflare")
+		if _ice_cache.is_empty():
+			status_changed.emit("Servidor TURN indisponível; tentando só com STUN")
+		return
+	_ice_cache = servers
+	_ice_fetched_at = _now_s()
+
+# Pede ao Worker as credenciais (autenticado com o token do Firebase) e converte
+# a resposta da Cloudflare para o formato do Godot. Devolve [] se falhar.
+func _fetch_ice() -> Array:
+	if not await Firebase.sign_in():
+		return []
+	var req := HTTPRequest.new()
+	req.timeout = TURN_FETCH_TIMEOUT
+	add_child(req)
+	var headers := PackedStringArray([
+		"Content-Type: application/json",
+		"Authorization: Bearer " + Firebase.id_token])
+	var err := req.request(TURN_ENDPOINT, headers, HTTPClient.METHOD_POST,
+			JSON.stringify({"ttl": TURN_TTL_S}))
+	if err != OK:
+		req.queue_free()
+		return []
+	var res: Array = await req.request_completed
+	req.queue_free()
+	if res[0] != HTTPRequest.RESULT_SUCCESS or res[1] < 200 or res[1] >= 300:
+		push_warning("TURN: Worker respondeu resultado=%d HTTP=%d" % [res[0], res[1]])
+		return []
+	var data: Variant = JSON.parse_string((res[3] as PackedByteArray).get_string_from_utf8())
+	return _parse_cloudflare_ice(data)
+
+# Resposta da Cloudflare: {"iceServers": [{urls:[stun...]}, {urls:[turn...], username, credential}]}
+# (aceita também "iceServers" como objeto único). Ignora as portas 53 e 5349: ficam
+# UDP 3478, TCP 3478, TCP 80 e TLS 443, um servidor por URL (como era no Metered).
+func _parse_cloudflare_ice(data: Variant) -> Array:
+	if not (data is Dictionary) or not data.has("iceServers"):
+		return []
+	var raw: Variant = data["iceServers"]
+	var list: Array = raw if raw is Array else [raw]
+	var out: Array = []
+	var has_turn := false
+	for entry in list:
+		if not (entry is Dictionary):
+			continue
+		var u: Variant = entry.get("urls", [])
+		var urls: Array = u if u is Array else [u]
+		for url in urls:
+			var s := str(url)
+			var port := s.get_slice("?", 0).get_slice(":", 2)
+			if s == "" or port == "53" or port == "5349":
+				continue
+			if entry.has("username") and entry.has("credential"):
+				out.append({"urls": s, "username": entry["username"], "credential": entry["credential"]})
+				has_turn = true
+			else:
+				out.append({"urls": s})
+	return out if has_turn else []
+
+func _now_s() -> float:
+	return Time.get_ticks_msec() / 1000.0
 
 func _make_connection() -> WebRTCPeerConnection:
 	var c := WebRTCPeerConnection.new()
@@ -656,6 +719,7 @@ func _begin() -> void:
 	Firebase.last_poll_error = ""
 
 func _reset_flags() -> void:
+	rival_uid = ""
 	_seen_ice.clear()
 	_offer_applied = false
 	_answer_applied = false

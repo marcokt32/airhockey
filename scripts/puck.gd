@@ -1,11 +1,13 @@
 extends Node2D
 
-signal goal(scorer_side: int)  # 0 = jogador de baixo marcou, 1 = jogador de cima
+signal goal(scorer_side: int, info: int)  # 0 = jogador de baixo marcou, 1 = jogador de cima; info = flags do gol (ver Achievements)
 signal wall_hit(impact: float)  # disco bateu na parede (impact = velocidade contra ela, px/s)
+signal paddle_hit(impact: float, mine: bool)  # taco bateu no disco (velocidade de aproximação, px/s; mine = foi o MEU taco)
 
 const FIELD := Vector2(320, 640)
 const GOAL_W := 110.0      # igual ao do main.gd
 const WALL_MIN_IMPACT := 60.0   # batidas mais fracas que isso (px/s) não geram som
+const HIT_MIN_IMPACT := 40.0    # toques no disco mais fracos que isso (px/s) não geram som
 const PADDLE_LEAD_MAX := 0.06   # host: quanto (s) adianta o taco do cliente na colisão
 const DEADZONE := 5.0           # cliente: erro de posição menor que isso (px) é ignorado
 # --- Física do disco (ajustáveis no Inspector para testes) ---
@@ -64,6 +66,9 @@ var _paddle_from := {}   # posição do rebatedor no tick anterior (para a colis
 var _mute_impacts := false   # true enquanto estima posição futura (sem som/vibração)
 var _dbg_snaps := 0          # diagnóstico: quantas vezes o cliente adotou o servidor
 var _dbg_t := 0.0
+var _last_touch := -1        # lado do último taco que tocou o disco (-1 = ninguém desde o saque)
+var _bounces := 0            # batidas na parede desde o último toque de taco (só conta no servidor)
+var _since_launch := 0.0     # segundos de jogo desde o saque (só no servidor)
 
 @onready var players: Node2D = get_node("../Players")
 
@@ -96,6 +101,7 @@ func _physics_process(delta: float) -> void:
 		if _freeze <= 0.0:
 			_launch()
 	else:
+		_since_launch += delta
 		velocity *= maxf(0.0, 1.0 - friction * delta)
 		var step_start := position
 		position += velocity * delta
@@ -197,6 +203,8 @@ func _predict_own_hit(p: Node2D, q0: Vector2, pv: Vector2, t0: Vector2, delta: f
 	_target = r[0]
 	_vel = r[1]
 	if r[2]:
+		if float(r[3]) >= HIT_MIN_IMPACT:
+			paddle_hit.emit(r[3], true)   # predição do meu golpe: som/vibração na hora, sem esperar a rede
 		# até o servidor confirmar (1 ping + folga), não aceita estado antigo
 		_hold_until = Time.get_ticks_msec() + int(clampf(Net.rtt_ms, 40.0, max_comp_ms) + 40.0)
 
@@ -224,6 +232,8 @@ func stop() -> void:
 		_net_sync.rpc(position, velocity, true)
 
 func _reset_center() -> void:
+	_last_touch = -1
+	_bounces = 0
 	position = FIELD / 2.0
 	velocity = Vector2.ZERO
 	_freeze = 1.5
@@ -231,6 +241,7 @@ func _reset_center() -> void:
 func _launch() -> void:
 	var dir_y := 1.0 if _serve_to == 0 else -1.0
 	velocity = Vector2(randf_range(-0.4, 0.4), dir_y).normalized() * serve_speed
+	_since_launch = 0.0
 
 # --- física ---
 func _update_paddle_velocities(delta: float) -> void:
@@ -288,6 +299,8 @@ func _wall_impact(into_wall: float) -> void:
 	if _mute_impacts:
 		return
 	if into_wall > WALL_MIN_IMPACT:
+		if multiplayer.is_server():
+			_bounces += 1   # para a conquista Ricochet (o cliente só prevê, quem conta é o servidor)
 		wall_hit.emit(into_wall)
 
 # Host: o taco do cliente chega com atraso de rede. Adianta-o um pouco (pela
@@ -307,16 +320,23 @@ func _paddle_hits(step_start: Vector2, delta: float) -> void:
 		var r: Array = _resolve_paddle(step_start, position, velocity, q0, q1, pv, p.radius, delta)
 		position = r[0]
 		velocity = r[1]
+		if r[2]:
+			_last_touch = int(p.side)   # quem tocou por último (gol contra) e zera as batidas na parede
+			_bounces = 0
+		if r[2] and float(r[3]) >= HIT_MIN_IMPACT:
+			# "meu" = taco de uma pessoa deste aparelho (o da CPU também tem autoridade no host, mas não vibra)
+			paddle_hit.emit(r[3], p.is_multiplayer_authority() and not bool(p.get("ai")))
 
 # Colisão CONTÍNUA disco x rebatedor (os dois se movem durante o passo).
 # p0->p1: trajeto do disco; q0->q1: trajeto do rebatedor; pv: velocidade do rebatedor.
 # Em vez de olhar só a posição final (o rebatedor "atravessava" o disco quando
 # andava mais que o diâmetro num tick), acha o PRIMEIRO instante de contato.
-# Retorna [posição final, velocidade final, bateu?]
+# Retorna [posição final, velocidade final, bateu?, força da batida (px/s)]
 func _resolve_paddle(p0: Vector2, p1: Vector2, vel: Vector2, q0: Vector2, q1: Vector2,
 		pv: Vector2, pr: float, delta: float) -> Array:
 	var rr := radius + pr
 	var hit := false
+	var impact := 0.0
 	var t := _sweep_circles(p0, p1, q0, q1, rr)
 	if t >= 0.0:
 		var cp := p0.lerp(p1, t)    # disco no instante do contato
@@ -335,6 +355,7 @@ func _resolve_paddle(p0: Vector2, p1: Vector2, vel: Vector2, q0: Vector2, q1: Ve
 				vel += n * (min_hit_speed - out_n)
 			vel = vel.limit_length(max_speed)
 			hit = true
+			impact = -rn
 		# o resto do passo o disco já anda com a velocidade nova, a partir do contato
 		p1 = cp + vel * delta * (1.0 - t)
 	# garantia final: nunca terminar o passo dentro do rebatedor
@@ -342,7 +363,7 @@ func _resolve_paddle(p0: Vector2, p1: Vector2, vel: Vector2, q0: Vector2, q1: Ve
 	var dist := d.length()
 	if dist < rr:
 		p1 = q1 + (d / dist if dist > 0.001 else Vector2.UP) * rr
-	return [p1, vel, hit]
+	return [p1, vel, hit, impact]
 
 # Primeiro instante t (0..1) em que dois círculos em movimento se tocam
 # (a = disco, b = rebatedor; r = soma dos raios). -1 se não se tocam no passo.
@@ -374,7 +395,15 @@ func _check_goal() -> void:
 		scorer = 1     # entrou no gol de baixo
 	if scorer == -1:
 		return
-	goal.emit(scorer)
+	var info := 0
+	if _since_launch <= Achievements.FAST_GOAL_SECONDS:
+		info |= Achievements.GOAL_FAST
+	if velocity.length() >= Achievements.ROCKET_SPEED:
+		info |= Achievements.GOAL_ROCKET
+	if _last_touch == 1 - scorer:   # o último toque foi de quem sofreu o gol
+		info |= Achievements.GOAL_OWN
+	info |= mini(_bounces, Achievements.BOUNCE_CAP) << Achievements.GOAL_BOUNCE_SHIFT
+	goal.emit(scorer, info)
 	_serve_to = 1 - scorer  # quem sofreu o gol recebe o saque
 	_reset_center()
 

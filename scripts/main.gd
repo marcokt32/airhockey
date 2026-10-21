@@ -40,8 +40,23 @@ var goal_panel: Label          # painel "GOL!" no meio da tela
 var _goal_tween: Tween
 var menu_catcher: Control      # tela cheia invisível: toque fora fecha o dropdown
 var menu_panel: VBoxContainer  # dropdown à esquerda, abaixo do cabeçalho
+var menu_social: Array[Button] = []   # Placar/Conquistas dentro do dropdown (jogo online e contra a CPU)
+var menu_restart: Button               # "Reiniciar": só contra a CPU
+var confirm_ok_btn: Button             # botão de confirmar (Sair / Reiniciar)
+var _confirm_restart := false          # a confirmação aberta é a de reiniciar (e não a de sair)
+var wait_bar: HBoxContainer    # Placar/Conquistas na espera (ao lado do "Sair")
+var end_social: HBoxContainer  # Placar/Conquistas no menu de fim de partida
 var confirm_root: Control      # confirmação de saída
 var confirm_msg: Label
+var rival_btn: Button            # toque no rival (nome/foto no cabeçalho) abre o perfil dele
+var rival_root: Control          # cartão com o perfil do rival
+var rival_card_avatar: UIStyle.Avatar
+var rival_card_name: Label
+var rival_card_level: Label
+var rival_card_rate: Label
+var rival_card_record: Label
+var rival_card_note: Label
+var rival_stats := {}            # {level, wins, losses} do rival online; vazio = sem dados
 var _in_room := false          # hospedou/entrou numa sala
 var _in_match := false         # partida em andamento (placar valendo)
 var _hint_tween: Tween
@@ -161,18 +176,30 @@ func _ready() -> void:
 	for l in [score_mine, score_sep, score_rival]:
 		score_box.add_child(l)
 
-	# Direita: nome + avatar do rival (mesma largura da esquerda => placar centralizado)
-	var rival_box := HBoxContainer.new()
-	rival_box.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	rival_box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	rival_box.custom_minimum_size = Vector2(96, 0)
-	rival_box.add_theme_constant_override("separation", 6)
-	header_row.add_child(rival_box)
+	# Direita: nome + avatar do rival (mesma largura da esquerda => placar centralizado).
+	# É um botão: tocar abre o perfil do rival (nível, taxa de vitórias).
+	rival_btn = Button.new()
+	rival_btn.focus_mode = Control.FOCUS_NONE
+	rival_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	rival_btn.custom_minimum_size = Vector2(96, 0)
+	rival_btn.add_theme_stylebox_override("normal", StyleBoxEmpty.new())
+	rival_btn.add_theme_stylebox_override("focus", StyleBoxEmpty.new())
+	rival_btn.add_theme_stylebox_override("hover", _flat_box(Color(1, 1, 1, 0.25)))
+	rival_btn.add_theme_stylebox_override("pressed", _flat_box(Color(0, 0, 0, 0.15)))
+	rival_btn.pressed.connect(_open_rival_card)
+	header_row.add_child(rival_btn)
+	var rival_inner := HBoxContainer.new()
+	rival_inner.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	rival_inner.add_theme_constant_override("separation", 6)
+	rival_btn.add_child(rival_inner)
+	rival_inner.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	rival_inner.offset_left = 4
+	rival_inner.offset_right = -4
 	name_rival = _header_label(false)
 	name_rival.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
 	avatar_rival = UIStyle.Avatar.new(AVATAR_SIZE)
-	rival_box.add_child(name_rival)
-	rival_box.add_child(avatar_rival)
+	rival_inner.add_child(name_rival)
+	rival_inner.add_child(avatar_rival)
 
 	# --- Botão sair da ESPERA (sem placar não há avatar/menu; durante a partida o menu é o avatar) ---
 	exit_btn = Button.new()
@@ -190,6 +217,15 @@ func _ready() -> void:
 	exit_btn.visible = false   # só aparece depois de hospedar/entrar e enquanto o header está escondido
 	exit_btn.pressed.connect(_open_confirm)
 	layer.add_child(exit_btn)
+
+	# Na espera também: Placar e Conquistas ao lado do "Sair"
+	wait_bar = HBoxContainer.new()
+	wait_bar.position = Vector2(76, 6)
+	wait_bar.add_theme_constant_override("separation", 6)
+	wait_bar.visible = false
+	wait_bar.add_child(_wait_button("Placar", _on_leaderboard_pressed))
+	wait_bar.add_child(_wait_button("Conquistas", _on_achievements_pressed))
+	layer.add_child(wait_bar)
 
 	# --- Ping (canto direito do cabeçalho). Tocar abre os detalhes ---
 	ping_btn = Button.new()
@@ -270,6 +306,13 @@ func _ready() -> void:
 	menu_panel.custom_minimum_size = Vector2(150, 0)
 	menu_panel.add_theme_constant_override("separation", 8)
 	menu_catcher.add_child(menu_panel)
+	var lb_item := _menu_button("Placar", _on_leaderboard_pressed, UIStyle.Kind.SECONDARY, 44)
+	var ach_item := _menu_button("Conquistas", _on_achievements_pressed, UIStyle.Kind.SECONDARY, 44)
+	for b in [lb_item, ach_item]:
+		menu_social.append(b)
+		menu_panel.add_child(b)
+	menu_restart = _menu_button("Reiniciar", _open_restart_confirm, UIStyle.Kind.SECONDARY, 44)
+	menu_panel.add_child(menu_restart)
 	menu_panel.add_child(_menu_button("Sair", _open_confirm, UIStyle.Kind.SECONDARY, 44))
 
 	# --- Confirmação de saída ---
@@ -303,10 +346,43 @@ func _ready() -> void:
 	row.add_theme_constant_override("separation", 12)
 	box.add_child(row)
 	var cancel_btn := _menu_button("Cancelar", _close_confirm, UIStyle.Kind.GHOST, 52)
-	var ok_btn := _menu_button("Sair", _confirm_exit, UIStyle.Kind.PRIMARY, 52)
+	var ok_btn := _menu_button("Sair", _confirm_ok, UIStyle.Kind.PRIMARY, 52)
+	confirm_ok_btn = ok_btn
 	for b in [cancel_btn, ok_btn]:
 		b.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 		row.add_child(b)
+
+	# --- Perfil do rival ---
+	rival_root = Control.new()
+	rival_root.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	rival_root.visible = false
+	layer.add_child(rival_root)
+	var rdim := ColorRect.new()
+	rdim.color = Color(0, 0, 0, 0.6)
+	rdim.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	rdim.mouse_filter = Control.MOUSE_FILTER_STOP
+	rdim.gui_input.connect(_on_rival_dim_input)
+	rival_root.add_child(rdim)
+	var rcenter := CenterContainer.new()
+	rcenter.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	rcenter.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	rival_root.add_child(rcenter)
+	var rbox := VBoxContainer.new()
+	rbox.custom_minimum_size = Vector2(280, 0)
+	rbox.add_theme_constant_override("separation", 10)
+	rcenter.add_child(rbox)
+	var avatar_row := CenterContainer.new()
+	rbox.add_child(avatar_row)
+	rival_card_avatar = UIStyle.Avatar.new(72.0)
+	avatar_row.add_child(rival_card_avatar)
+	rival_card_name = _card_label(20, 44)
+	rival_card_level = _card_label(16, 40)
+	rival_card_rate = _card_label(16, 40)
+	rival_card_record = _card_label(14, 40)
+	rival_card_note = _card_label(12, 0)
+	for l in [rival_card_name, rival_card_level, rival_card_rate, rival_card_record, rival_card_note]:
+		rbox.add_child(l)
+	rbox.add_child(_menu_button("Fechar", _close_rival_card, UIStyle.Kind.PRIMARY, 48))
 
 	# --- Fim de partida: resultado + Revanche / Sair ---
 	end_root = Control.new()
@@ -345,6 +421,14 @@ func _ready() -> void:
 	end_box.add_child(end_sub)
 	rematch_btn = _menu_button("Revanche", _on_rematch_pressed, UIStyle.Kind.PRIMARY, 52)
 	end_box.add_child(rematch_btn)
+	end_social = HBoxContainer.new()
+	end_social.add_theme_constant_override("separation", 12)
+	var end_lb := _menu_button("Placar", _on_leaderboard_pressed, UIStyle.Kind.SECONDARY, 44)
+	var end_ach := _menu_button("Conquistas", _on_achievements_pressed, UIStyle.Kind.SECONDARY, 44)
+	for sb in [end_lb, end_ach]:
+		sb.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		end_social.add_child(sb)
+	end_box.add_child(end_social)
 	end_box.add_child(_menu_button("Sair", _on_exit_pressed, UIStyle.Kind.GHOST, 52))
 
 	# --- Pop-up de avaliação (aparece no fim de uma partida, depois de alguns minutos jogados) ---
@@ -376,6 +460,7 @@ func _ready() -> void:
 	PlayGames.avatar_changed.connect(_refresh_score)   # minha foto chegou depois do cabeçalho existir
 	puck.goal.connect(_on_goal)
 	puck.wall_hit.connect(_on_wall_hit)
+	puck.paddle_hit.connect(_on_paddle_hit)
 
 # ---------------------------------------------------------------- menu da partida
 
@@ -388,13 +473,112 @@ func _menu_button(text: String, callback: Callable, kind: UIStyle.Kind, h: float
 	UIStyle.style_button(b, kind)
 	return b
 
+# Botão pequeno da espera (mesmo visual do "Sair" daquela tela)
+func _wait_button(text: String, callback: Callable) -> Button:
+	var b := Button.new()
+	b.text = text
+	b.focus_mode = Control.FOCUS_NONE
+	b.custom_minimum_size = Vector2(0, 32)
+	b.add_theme_font_size_override("font_size", 14)
+	b.add_theme_constant_override("outline_size", UIStyle.OUTLINE_SIZE_TEXT)
+	b.add_theme_color_override("font_color", UIStyle.TEXT_DARK)
+	b.add_theme_color_override("font_hover_color", UIStyle.TEXT_DARK)
+	b.add_theme_color_override("font_pressed_color", UIStyle.TEXT_DARK)
+	for state in ["normal", "hover", "pressed"]:
+		b.add_theme_stylebox_override(state, UIStyle.label_box(8.0))
+	b.pressed.connect(callback)
+	return b
+
+# Sem login, o toque tenta entrar no Play Games (ver PlayGames.show_*)
+func _on_leaderboard_pressed() -> void:
+	_close_menu()
+	PlayGames.show_leaderboard()
+
+func _on_achievements_pressed() -> void:
+	_close_menu()
+	PlayGames.show_achievements()
+
+# Linha de texto do cartão do rival (mesmo visual do aviso de confirmação)
+func _card_label(font_size: int, min_h: float) -> Label:
+	var l := Label.new()
+	l.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	l.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	l.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	l.custom_minimum_size = Vector2(280, min_h)
+	l.add_theme_font_size_override("font_size", font_size)
+	l.add_theme_color_override("font_color", UIStyle.TEXT_DARK)
+	l.add_theme_stylebox_override("normal", UIStyle.label_box())
+	return l
+
+func _pct_text(v: float) -> String:
+	return ("%.1f" % v).replace(".", ",") + "%"
+
+func _open_rival_card() -> void:
+	if confirm_root.visible or _ending or menu_catcher.visible:
+		return
+	rival_card_avatar.texture = UIStyle.rival_avatar
+	rival_card_name.text = rival_name
+	rival_card_note.visible = false
+	if Net.vs_cpu:
+		var diffs := ["Fácil", "Normal", "Difícil"]
+		rival_card_level.text = "Computador"
+		rival_card_rate.text = "Dificuldade: %s" % diffs[clampi(Net.cpu_level, 0, 2)]
+		rival_card_record.visible = false
+	elif rival_stats.is_empty():
+		rival_card_level.text = "Nível: --"
+		rival_card_rate.text = "Taxa de vitórias: --"
+		rival_card_record.visible = false
+		rival_card_note.text = "Este jogador usa uma versão antiga do jogo, sem perfil."
+		rival_card_note.visible = true
+	else:
+		var w: int = rival_stats.wins
+		var d: int = rival_stats.losses
+		var n := w + d
+		rival_card_level.text = "Nível %d" % rival_stats.level
+		rival_card_record.visible = true
+		if n > 0:
+			rival_card_rate.text = "Taxa de vitórias: %s" % _pct_text(100.0 * float(w) / float(n))
+			rival_card_record.text = "%d vitórias • %d derrotas (online)" % [w, d]
+		else:
+			rival_card_rate.text = "Taxa de vitórias: --"
+			rival_card_record.text = "Ainda sem partidas online"
+		if n < PlayGames.MIN_RATED_MATCHES:
+			rival_card_note.text = "Poucas partidas: a taxa ainda pode variar bastante."
+			rival_card_note.visible = true
+	rival_root.visible = true
+	_hide_hint()
+	_update_blocking()
+
+func _on_rival_dim_input(event: InputEvent) -> void:
+	if event is InputEventMouseButton and event.pressed:
+		_close_rival_card()
+
+func _close_rival_card() -> void:
+	rival_root.visible = false
+	_update_blocking()
+
+# Texto enviado ao rival no lugar do nome puro: "nome|nível|vitórias|derrotas".
+# Vai dentro do _set_name (RPC que já existe): criar uma RPC nova mudaria a lista de RPCs
+# do script e as versões antigas e novas do jogo deixariam de se entender.
+func _my_name_payload() -> String:
+	var n := Net.player_name.replace("|", "").replace("\n", " ").strip_edges()
+	return "%s|%d|%d|%d" % [n, PlayGames.level(), PlayGames.rated_wins, PlayGames.rated_losses]
+
 func _update_blocking() -> void:
-	UIStyle.ui_blocking = menu_catcher.visible or confirm_root.visible \
+	UIStyle.ui_blocking = menu_catcher.visible or confirm_root.visible or rival_root.visible \
 			or end_root.visible or (_rate != null and _rate.is_open())
+	# banner do rodapé só enquanto o menu do avatar está aberto (nunca com a partida rolando sem menu)
+	Monetization.set_banner_wanted("pause", menu_catcher.visible)
+
+func _exit_tree() -> void:
+	Monetization.set_banner_wanted("pause", false)
 
 func _toggle_menu() -> void:
-	if confirm_root.visible or _ending:
+	if confirm_root.visible or rival_root.visible or _ending:
 		return
+	for b in menu_social:
+		b.visible = PlayGames.can_show_social()
+	menu_restart.visible = Net.vs_cpu   # reiniciar só existe contra a CPU
 	menu_catcher.visible = not menu_catcher.visible
 	_hide_hint()   # quem abriu o menu já descobriu
 	_update_blocking()
@@ -411,6 +595,8 @@ func _open_confirm() -> void:
 	if _ending:
 		return
 	menu_catcher.visible = false
+	_confirm_restart = false
+	confirm_ok_btn.text = "Sair"
 	if _in_match and not Net.vs_cpu:
 		confirm_msg.text = "Sair agora conta como DERROTA nesta partida online.\nDeseja sair?"
 	else:
@@ -420,7 +606,39 @@ func _open_confirm() -> void:
 
 func _close_confirm() -> void:
 	confirm_root.visible = false
+	_confirm_restart = false
 	_update_blocking()
+
+func _open_restart_confirm() -> void:
+	if _ending or not Net.vs_cpu:
+		return
+	menu_catcher.visible = false
+	_confirm_restart = true
+	confirm_ok_btn.text = "Reiniciar"
+	confirm_msg.text = "Reiniciar a partida?\nO placar volta para 0 x 0."
+	confirm_root.visible = true
+	_update_blocking()
+
+# Botão de confirmar da janela: faz o que foi pedido (reiniciar ou sair)
+func _confirm_ok() -> void:
+	if _confirm_restart:
+		_restart_cpu_match()
+	else:
+		_confirm_exit()
+
+# Contra a CPU: zera o placar e saca de novo, sem sair da partida. Não conta como partida
+# terminada (sem XP, sem anúncio): reiniciar no meio não vale nada.
+func _restart_cpu_match() -> void:
+	_confirm_restart = false
+	confirm_root.visible = false
+	menu_catcher.visible = false
+	if _goal_tween:
+		_goal_tween.kill()
+	goal_panel.visible = false
+	_update_blocking()
+	if _ending or not Net.vs_cpu:
+		return
+	_try_start()   # zera o placar e saca (o placar volta pelo _sync_score)
 
 func _confirm_exit() -> void:
 	if _ending:
@@ -474,6 +692,7 @@ func _process(delta: float) -> void:
 		_session_play += delta   # tempo de jogo para o pop-up de avaliação
 	info_label.visible = info_label.text != ""
 	exit_btn.visible = _in_room and not header.visible and not _ending   # só na espera
+	wait_bar.visible = exit_btn.visible and PlayGames.can_show_social()
 	ping_btn.visible = header.visible and not Net.vs_cpu   # só online
 	debug_label.visible = _debug_open and header.visible and not Net.vs_cpu
 
@@ -526,6 +745,7 @@ func _start_cpu_match() -> void:
 	_add_player(1)
 	spawner.spawn({"id": "cpu", "side": _free_side(), "ai": true, "level": Net.cpu_level})
 	rival_name = "CPU"
+	rival_stats = {}
 	info_label.text = ""
 	_try_start()
 
@@ -542,13 +762,13 @@ func _on_room_status(text: String) -> void:
 func _on_joined() -> void:
 	_in_room = true
 	info_label.text = ""
-	_set_name.rpc(Net.player_name)   # <- novo
+	_set_name.rpc(_my_name_payload())
 	_set_avatar.rpc(PlayGames.my_avatar_jpg)
 
 func _on_peer_connected(id: int) -> void:
 	if multiplayer.is_server():
 		_add_player(id)
-		_set_name.rpc_id(id, Net.player_name)   # <- novo
+		_set_name.rpc_id(id, _my_name_payload())
 		_set_avatar.rpc_id(id, PlayGames.my_avatar_jpg)
 		_try_start()
 		info_label.text = ""
@@ -606,6 +826,10 @@ func _on_wall_hit(impact: float) -> void:
 	if _in_match:
 		GameAudio.wall(impact)   # som + vibração bem sutil
 
+func _on_paddle_hit(impact: float, mine: bool) -> void:
+	if _in_match:
+		GameAudio.hit(impact, mine)   # som do taco + vibração sutil (só no meu taco)
+
 func _on_goal(scorer_side: int) -> void:
 	scores[scorer_side] += 1
 	_sync_score()
@@ -660,14 +884,25 @@ func _set_match_active(active: bool) -> void:
 		_close_menu()
 		_close_confirm()
 		scores = [0, 0]
-		rival_name = "Rival"   # <- novo
+		rival_name = "Rival"
+		rival_stats = {}
+		_close_rival_card()
 		UIStyle.rival_avatar = null
 		_refresh_score()
 
 @rpc("any_peer", "reliable")
 func _set_name(n: String) -> void:
-	n = n.replace("\n", " ").strip_edges().left(10)
-	rival_name = n if n != "" else "Rival"
+	# Formato novo: "nome|nível|vitórias|derrotas". Versão antiga manda só o nome.
+	var parts := n.split("|")
+	rival_stats = {}
+	if parts.size() >= 4 and parts[1].is_valid_int() and parts[2].is_valid_int() and parts[3].is_valid_int():
+		rival_stats = {
+			"level": clampi(int(parts[1]), 1, 999),
+			"wins": clampi(int(parts[2]), 0, 1000000),
+			"losses": clampi(int(parts[3]), 0, 1000000),
+		}
+	var clean := parts[0].replace("\n", " ").strip_edges().left(10)
+	rival_name = clean if clean != "" else "Rival"
 	_refresh_score()
 
 # Foto do rival (JPEG pequeno). Vazio = ele não tem foto: fica a silhueta
@@ -714,8 +949,11 @@ func _on_exit_pressed() -> void:
 	if _ending:
 		return
 	_ending = true
+	var finished := _match_done      # saindo DEPOIS de uma partida terminada (desistir não mostra anúncio)
 	_flush_play_time()
 	Net.leave()                      # fecha a conexão e limpa a sala no Firebase
+	if finished:
+		await Monetization.show_if_due()   # só mostra se as regras de frequência deixarem
 	get_tree().reload_current_scene()  # volta ao menu (com o overlay)
 
 # Só no servidor: decide o vencedor e avisa todos. A próxima partida só começa com a REVANCHE.
@@ -734,6 +972,7 @@ func _match_over(winner_side: int) -> void:
 	_match_done = true
 	_flush_play_time()
 	PlayGames.record_match(won, scores[my_side], Net.vs_cpu, Net.cpu_level)
+	Monetization.on_match_finished()   # conta a partida e deixa o próximo anúncio carregando
 	# deixa o painel "GOL!" aparecer antes do apito final e do resultado (mesmo lugar da tela)
 	await get_tree().create_timer(GOAL_PANEL_SECONDS).timeout
 	if _ending or not _match_done:   # saiu, ou o rival foi embora nesse meio tempo
@@ -746,6 +985,7 @@ func _match_over(winner_side: int) -> void:
 	if PlayGames.last_level_up:
 		t += " · Nível %d!" % PlayGames.level()
 	end_title.text = t
+	end_social.visible = PlayGames.can_show_social()
 	_refresh_end_menu()
 	end_root.visible = true
 	_update_blocking()
@@ -762,6 +1002,13 @@ func _on_rematch_pressed() -> void:
 	if _ending or not _match_done:
 		return
 	if Net.vs_cpu:
+		# Contra a CPU: a cada 3 partidas terminadas (contando as de revanche) mostra um anúncio
+		# antes de começar a próxima. Online NUNCA: o rival ficaria esperando o anúncio fechar.
+		rematch_btn.disabled = true   # evita toque duplo enquanto o anúncio está aberto
+		await Monetization.show_if_due()
+		if _ending or not _match_done:
+			return
+		rematch_btn.disabled = false
 		_start_rematch()
 	elif multiplayer.is_server():
 		_add_rematch_vote(1)
