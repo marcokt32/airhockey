@@ -11,6 +11,9 @@ const PATH_HIT := "res://audio/hit.wav"                     # taco bate no disco
 const PATH_WHISTLE_START := "res://audio/whistle_start.wav" # apito de início
 const PATH_WHISTLE_END := "res://audio/whistle_end.wav"     # apito de fim
 const PATH_CROWD := "res://audio/crowd.ogg"                 # torcida no gol
+# Socos do X1: um sorteado a cada golpe (arquivo ausente = fica de fora; sem nenhum, usa o som do taco)
+const PATHS_PUNCH := ["res://audio/punch1.wav", "res://audio/punch2.wav", "res://audio/punch3.wav",
+		"res://audio/punch4.wav", "res://audio/punch5.wav"]
 
 # Volumes (dB; 0 = original, negativo = mais baixo)
 const MUSIC_DB_MENU := -10.0     # música no menu
@@ -21,6 +24,8 @@ const HIT_DB_SOFT := -16.0       # toque leve do taco
 const HIT_DB_HARD := -5.0        # tacada forte
 const WHISTLE_DB := -2.0
 const CROWD_DB := -3.0
+const PUNCH_DB_SOFT := -9.0      # soco fraco
+const PUNCH_DB_HARD := -1.0      # soco forte
 
 # Vibração
 const WALL_BUZZ_MS := 22         # parede: curta, mas já dá para sentir...
@@ -47,6 +52,10 @@ var _hit: AudioStreamPlayer
 var _whistle_start: AudioStreamPlayer
 var _whistle_end: AudioStreamPlayer
 var _crowd: AudioStreamPlayer
+var _punches: Array[AudioStreamPlayer] = []
+var _last_punch_ms := 0
+var _last_punch_buzz_ms := 0
+var _last_punch_idx := -1
 var _music_tween: Tween
 var _last_wall_ms := 0
 var _last_buzz_ms := 0
@@ -83,6 +92,12 @@ static func goal() -> void:
 	_inst._play(_inst._crowd, sfx_enabled)
 	vibrate(GOAL_BUZZ_MS, GOAL_BUZZ_AMP)
 
+## Soco do X1: sorteia um dos sons, com volume e tom levemente aleatórios.
+## strength 0..1 (força do golpe); buzz = vibração curtinha (só nos meus toques).
+static func punch(strength: float = 0.7, buzz: bool = false) -> void:
+	if _ready_inst():
+		_inst._on_punch(strength, buzz)
+
 static func whistle_start() -> void:
 	if _ready_inst():
 		_inst._play(_inst._whistle_start, sfx_enabled)
@@ -112,6 +127,10 @@ func _ready() -> void:
 	_whistle_start = _make_player(PATH_WHISTLE_START, WHISTLE_DB)
 	_whistle_end = _make_player(PATH_WHISTLE_END, WHISTLE_DB)
 	_crowd = _make_player(PATH_CROWD, CROWD_DB)
+	for path in PATHS_PUNCH:
+		var pp := _make_player(path, PUNCH_DB_SOFT, false, 2)
+		if pp.stream != null:
+			_punches.append(pp)
 	if music_enabled and _music.stream != null:
 		_music.play()
 
@@ -157,6 +176,26 @@ func _on_hit(impact: float, mine: bool) -> void:
 	if mine and impact >= HIT_BUZZ_MIN_IMPACT and now - _last_hit_buzz_ms > 90:
 		_last_hit_buzz_ms = now
 		vibrate(HIT_BUZZ_MS, lerpf(HIT_BUZZ_MIN, HIT_BUZZ_MAX, k))
+
+func _on_punch(strength: float, buzz: bool) -> void:
+	var now := Time.get_ticks_msec()
+	var k := clampf(strength, 0.0, 1.0)
+	if sfx_enabled and now - _last_punch_ms > 40:
+		_last_punch_ms = now
+		if _punches.is_empty():
+			_on_hit(lerpf(150.0, 700.0, k), false)   # sem arquivos de soco: usa o som do taco no disco
+		else:
+			var idx := randi() % _punches.size()
+			if _punches.size() > 1 and idx == _last_punch_idx:
+				idx = (idx + 1 + randi() % (_punches.size() - 1)) % _punches.size()   # nunca o mesmo duas vezes seguidas
+			_last_punch_idx = idx
+			var p := _punches[idx]
+			p.volume_db = lerpf(PUNCH_DB_SOFT, PUNCH_DB_HARD, k) + randf_range(-1.5, 1.5)
+			p.pitch_scale = randf_range(0.88, 1.15)
+			p.play()
+	if buzz and now - _last_punch_buzz_ms > 90:
+		_last_punch_buzz_ms = now
+		vibrate(14, lerpf(0.25, 0.6, k))
 
 func _fade_music(in_match: bool) -> void:
 	_in_match = in_match

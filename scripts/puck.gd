@@ -64,6 +64,8 @@ var _prev_pos := {}
 var _paddle_vel := {}
 var _paddle_from := {}   # posição do rebatedor no tick anterior (para a colisão contínua)
 var _mute_impacts := false   # true enquanto estima posição futura (sem som/vibração)
+var _nerf_until := [0, 0]      # (ms) até quando o taco de cada lado está enfraquecido
+var _nerf_power := [1.0, 1.0]  # força devolvida ao disco enquanto enfraquecido (1 = normal)
 var _dbg_snaps := 0          # diagnóstico: quantas vezes o cliente adotou o servidor
 var _dbg_t := 0.0
 var _last_touch := -1        # lado do último taco que tocou o disco (-1 = ninguém desde o saque)
@@ -199,7 +201,7 @@ func _push_out_of_paddles(p: Vector2) -> Vector2:
 	return p
 
 func _predict_own_hit(p: Node2D, q0: Vector2, pv: Vector2, t0: Vector2, delta: float) -> void:
-	var r: Array = _resolve_paddle(t0, _target, _vel, q0, p.position, pv, p.radius, delta)
+	var r: Array = _resolve_paddle(t0, _target, _vel, q0, p.position, pv, p.radius, delta, power_of(int(p.side)))
 	_target = r[0]
 	_vel = r[1]
 	if r[2]:
@@ -219,9 +221,24 @@ func _oneway_s() -> float:
 
 
 # --- controle (chamado pelo Main, só no servidor) ---
-func serve() -> void:
+## Enfraquece o taco de um lado por `seconds`: o golpe devolve só `power` (0..1) da energia ao disco.
+## Chamado nos DOIS aparelhos (o servidor simula, o cliente prevê o próprio golpe).
+func nerf(side: int, seconds: float, power: float) -> void:
+	side = clampi(side, 0, 1)
+	_nerf_until[side] = Time.get_ticks_msec() + int(seconds * 1000.0)
+	_nerf_power[side] = clampf(power, 0.0, 1.0)
+
+## Segundos que faltam de enfraquecimento (0 = normal).
+func nerf_left(side: int) -> float:
+	return maxf(0.0, float(int(_nerf_until[clampi(side, 0, 1)]) - Time.get_ticks_msec()) / 1000.0)
+
+func power_of(side: int) -> float:
+	return float(_nerf_power[clampi(side, 0, 1)]) if nerf_left(side) > 0.0 else 1.0
+
+## to_side: lado que recebe o saque (0 = baixo, 1 = cima). -1 = sorteia. O X1 passa o lado de quem ganhou a posse.
+func serve(to_side: int = -1) -> void:
 	active = true
-	_serve_to = randi() % 2
+	_serve_to = randi() % 2 if to_side < 0 else clampi(to_side, 0, 1)
 	_reset_center()
 
 func stop() -> void:
@@ -317,7 +334,7 @@ func _paddle_hits(step_start: Vector2, delta: float) -> void:
 		var q1 := _paddle_pos(p) + lead
 		var q0: Vector2 = _paddle_from.get(p.name, _paddle_pos(p)) + lead
 		var pv: Vector2 = _paddle_vel.get(p.name, Vector2.ZERO)
-		var r: Array = _resolve_paddle(step_start, position, velocity, q0, q1, pv, p.radius, delta)
+		var r: Array = _resolve_paddle(step_start, position, velocity, q0, q1, pv, p.radius, delta, power_of(int(p.side)))
 		position = r[0]
 		velocity = r[1]
 		if r[2]:
@@ -333,7 +350,7 @@ func _paddle_hits(step_start: Vector2, delta: float) -> void:
 # andava mais que o diâmetro num tick), acha o PRIMEIRO instante de contato.
 # Retorna [posição final, velocidade final, bateu?, força da batida (px/s)]
 func _resolve_paddle(p0: Vector2, p1: Vector2, vel: Vector2, q0: Vector2, q1: Vector2,
-		pv: Vector2, pr: float, delta: float) -> Array:
+		pv: Vector2, pr: float, delta: float, power: float = 1.0) -> Array:
 	var rr := radius + pr
 	var hit := false
 	var impact := 0.0
@@ -348,12 +365,14 @@ func _resolve_paddle(p0: Vector2, p1: Vector2, vel: Vector2, q0: Vector2, q1: Ve
 		var rel := vel - pv
 		var rn := rel.dot(n)
 		if rn < 0.0:
+			var vel_in := vel                                # velocidade antes do golpe
 			rel = rel - (1.0 + hit_restitution) * rn * n    # rebote só na componente normal
 			vel = pv + rel + pv * (hit_boost - 1.0)         # + a velocidade do taco (com ganho)
 			var out_n := vel.dot(n)
 			if out_n < min_hit_speed:                       # toque leve ainda "dá vida" ao disco
 				vel += n * (min_hit_speed - out_n)
 			vel = vel.limit_length(max_speed)
+			vel = vel_in + (vel - vel_in) * power            # taco enfraquecido: só parte do impulso passa ao disco
 			hit = true
 			impact = -rn
 		# o resto do passo o disco já anda com a velocidade nova, a partir do contato

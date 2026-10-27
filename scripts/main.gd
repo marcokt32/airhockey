@@ -4,7 +4,13 @@ const PLAYER_SCENE: PackedScene = preload("res://scenes/player.tscn")
 const FIELD := Vector2(320, 640)
 const GOAL_W := 110.0     # igual ao do puck.gd
 const GOAL_DEPTH := 24.0  # profundidade desenhada dos gols (fica fora do campo)
-const HEADER_H := 44.0    # altura do cabeçalho com o placar
+const HEADER_H := 56.0    # altura do cabeçalho com o placar (agora com a barra de raiva embaixo de cada nome)
+# --- Barra de raiva e X1 no meio do jogo ---
+const RAGE_GAIN := 0.34       # tomar gol enche a barra: ~3 gols seguidos deixam cheia
+const RAGE_DROP := 0.34       # fazer gol esvazia
+const NERF_SECONDS := 8.0     # quanto tempo o perdedor do X1 fica enfraquecido
+const NERF_POWER := 0.6       # fração da força que o taco devolve ao disco enquanto enfraquecido (1 = normal)
+const CPU_X1_DELAY := 1.8     # a CPU (Normal/Difícil) espera isso para apertar o X1 quando a barra dela enche
 const START_POS := [Vector2(160, 560), Vector2(160, 80)]
 const WIN_SCORE := 7
 const AVATAR_SIZE := 32.0
@@ -40,10 +46,6 @@ var goal_panel: Label          # painel "GOL!" no meio da tela
 var _goal_tween: Tween
 var menu_catcher: Control      # tela cheia invisível: toque fora fecha o dropdown
 var menu_panel: VBoxContainer  # dropdown à esquerda, abaixo do cabeçalho
-var menu_social: Array[Button] = []   # Placar/Conquistas dentro do dropdown (jogo online e contra a CPU)
-var menu_restart: Button               # "Reiniciar": só contra a CPU
-var confirm_ok_btn: Button             # botão de confirmar (Sair / Reiniciar)
-var _confirm_restart := false          # a confirmação aberta é a de reiniciar (e não a de sair)
 var wait_bar: HBoxContainer    # Placar/Conquistas na espera (ao lado do "Sair")
 var end_social: HBoxContainer  # Placar/Conquistas no menu de fim de partida
 var confirm_root: Control      # confirmação de saída
@@ -68,6 +70,14 @@ var _match_done := false       # partida terminou e o menu de fim está valendo
 var _rematch_votes: Array = [] # ids de quem pediu revanche (decidido no servidor)
 var _session_play := 0.0       # segundos de partida jogados desde a última gravação
 var _rate: RatePrompt          # pop-up "avalie com 5 estrelas"
+var _faceoff: FaceOff          # X1: disputa de poder (começo da partida e botão de raiva)
+var rage := [0.0, 0.0]         # barra de raiva por LADO (0 = baixo, 1 = cima), de 0 a 1
+var meter_mine: RageMeter
+var meter_rival: RageMeter
+var x1_btn: Button             # meu botão X1 (aparece com a barra cheia)
+var tag_mine: Label            # "FRACO 5s" embaixo da minha barra
+var tag_rival: Label           # "X1!" (rival pode chamar) ou "FRACO 5s", embaixo da barra dele
+var _cpu_x1_wait := 0.0
 
 @onready var players: Node2D = $Players
 @onready var spawner: MultiplayerSpawner = $MultiplayerSpawner
@@ -159,10 +169,22 @@ func _ready() -> void:
 	me_inner.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	me_inner.offset_left = 4
 	me_inner.offset_right = -4
+	me_inner.offset_top = 2
+	me_inner.offset_bottom = -4
 	avatar_mine = UIStyle.Avatar.new(AVATAR_SIZE)
 	name_mine = _header_label(false)
+	name_mine.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	meter_mine = RageMeter.new()
+	meter_mine.mine = true
+	meter_mine.custom_minimum_size = Vector2(0, 14)
+	var me_col := VBoxContainer.new()
+	me_col.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	me_col.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	me_col.add_theme_constant_override("separation", 1)
+	me_col.add_child(name_mine)
+	me_col.add_child(meter_mine)
 	me_inner.add_child(avatar_mine)
-	me_inner.add_child(name_mine)
+	me_inner.add_child(me_col)
 
 	# Centro: placar
 	var score_box := HBoxContainer.new()
@@ -195,10 +217,22 @@ func _ready() -> void:
 	rival_inner.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	rival_inner.offset_left = 4
 	rival_inner.offset_right = -4
+	rival_inner.offset_top = 2
+	rival_inner.offset_bottom = -4
 	name_rival = _header_label(false)
 	name_rival.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
 	avatar_rival = UIStyle.Avatar.new(AVATAR_SIZE)
-	rival_inner.add_child(name_rival)
+	name_rival.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	meter_rival = RageMeter.new()
+	meter_rival.mine = false
+	meter_rival.custom_minimum_size = Vector2(0, 14)
+	var rival_col := VBoxContainer.new()
+	rival_col.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	rival_col.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	rival_col.add_theme_constant_override("separation", 1)
+	rival_col.add_child(name_rival)
+	rival_col.add_child(meter_rival)
+	rival_inner.add_child(rival_col)
 	rival_inner.add_child(avatar_rival)
 
 	# --- Botão sair da ESPERA (sem placar não há avatar/menu; durante a partida o menu é o avatar) ---
@@ -227,6 +261,21 @@ func _ready() -> void:
 	wait_bar.add_child(_wait_button("Conquistas", _on_achievements_pressed))
 	layer.add_child(wait_bar)
 
+	# --- X1 da raiva: botão (meu) e etiquetas, logo abaixo da barra de cada nome ---
+	x1_btn = Button.new()
+	x1_btn.text = "X1"
+	x1_btn.focus_mode = Control.FOCUS_NONE
+	x1_btn.custom_minimum_size = Vector2(84, 30)
+	UIStyle.style_button(x1_btn, UIStyle.Kind.PRIMARY)
+	x1_btn.add_theme_font_size_override("font_size", 18)
+	x1_btn.visible = false
+	x1_btn.pressed.connect(_on_x1_pressed)
+	layer.add_child(x1_btn)
+	tag_mine = _tag_label(HORIZONTAL_ALIGNMENT_LEFT)
+	layer.add_child(tag_mine)
+	tag_rival = _tag_label(HORIZONTAL_ALIGNMENT_RIGHT)
+	layer.add_child(tag_rival)
+
 	# --- Ping (canto direito do cabeçalho). Tocar abre os detalhes ---
 	ping_btn = Button.new()
 	ping_btn.text = "-- ms"
@@ -235,8 +284,8 @@ func _ready() -> void:
 	ping_btn.anchor_right = 1.0
 	ping_btn.offset_left = -56
 	ping_btn.offset_right = -8
-	ping_btn.offset_top = HEADER_H + 4      # abaixo do header (a direita do header agora é o avatar do rival)
-	ping_btn.offset_bottom = HEADER_H + 22
+	ping_btn.offset_top = HEADER_H + 38     # abaixo da etiqueta do X1 do rival
+	ping_btn.offset_bottom = HEADER_H + 56
 	ping_btn.alignment = HORIZONTAL_ALIGNMENT_RIGHT
 	ping_btn.add_theme_font_size_override("font_size", PING_FONT_SIZE)   # <- tamanho da fonte do ping
 	ping_btn.add_theme_constant_override("outline_size", 2)
@@ -252,7 +301,7 @@ func _ready() -> void:
 	debug_label.anchor_right = 1.0
 	debug_label.offset_left = 6
 	debug_label.offset_right = -6
-	debug_label.offset_top = HEADER_H + 28
+	debug_label.offset_top = HEADER_H + 62
 	debug_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	debug_label.add_theme_font_size_override("font_size", 12)
 	debug_label.add_theme_color_override("font_color", UIStyle.TEXT_DARK)
@@ -286,7 +335,7 @@ func _ready() -> void:
 	# --- Dica: aparece ao iniciar a partida e some sozinha ---
 	hint_label = Label.new()
 	hint_label.text = "Toque na sua foto para abrir o menu"
-	hint_label.position = Vector2(6, HEADER_H + 8)
+	hint_label.position = Vector2(6, HEADER_H + 40)
 	hint_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	hint_label.add_theme_font_size_override("font_size", 12)
 	hint_label.add_theme_color_override("font_color", UIStyle.TEXT_DARK)
@@ -306,13 +355,6 @@ func _ready() -> void:
 	menu_panel.custom_minimum_size = Vector2(150, 0)
 	menu_panel.add_theme_constant_override("separation", 8)
 	menu_catcher.add_child(menu_panel)
-	var lb_item := _menu_button("Placar", _on_leaderboard_pressed, UIStyle.Kind.SECONDARY, 44)
-	var ach_item := _menu_button("Conquistas", _on_achievements_pressed, UIStyle.Kind.SECONDARY, 44)
-	for b in [lb_item, ach_item]:
-		menu_social.append(b)
-		menu_panel.add_child(b)
-	menu_restart = _menu_button("Reiniciar", _open_restart_confirm, UIStyle.Kind.SECONDARY, 44)
-	menu_panel.add_child(menu_restart)
 	menu_panel.add_child(_menu_button("Sair", _open_confirm, UIStyle.Kind.SECONDARY, 44))
 
 	# --- Confirmação de saída ---
@@ -346,8 +388,7 @@ func _ready() -> void:
 	row.add_theme_constant_override("separation", 12)
 	box.add_child(row)
 	var cancel_btn := _menu_button("Cancelar", _close_confirm, UIStyle.Kind.GHOST, 52)
-	var ok_btn := _menu_button("Sair", _confirm_ok, UIStyle.Kind.PRIMARY, 52)
-	confirm_ok_btn = ok_btn
+	var ok_btn := _menu_button("Sair", _confirm_exit, UIStyle.Kind.PRIMARY, 52)
 	for b in [cancel_btn, ok_btn]:
 		b.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 		row.add_child(b)
@@ -435,6 +476,13 @@ func _ready() -> void:
 	_rate = RatePrompt.new()
 	add_child(_rate)
 	_rate.closed.connect(_update_blocking)
+
+	# --- X1 (disputa de posse). O nome precisa ser igual nos dois aparelhos: as RPCs dele moram nesse nó ---
+	_faceoff = FaceOff.new()
+	_faceoff.name = "FaceOff"
+	add_child(_faceoff)
+	_faceoff.finished.connect(_on_faceoff_finished)
+	_faceoff.state_changed.connect(_update_blocking)
 
 	UIStyle.hud_top = HEADER_H
 	UIStyle.ui_blocking = false   # o static sobrevive ao reload da cena
@@ -566,7 +614,8 @@ func _my_name_payload() -> String:
 
 func _update_blocking() -> void:
 	UIStyle.ui_blocking = menu_catcher.visible or confirm_root.visible or rival_root.visible \
-			or end_root.visible or (_rate != null and _rate.is_open())
+			or end_root.visible or (_rate != null and _rate.is_open()) \
+			or (_faceoff != null and _faceoff.is_active())
 	# banner do rodapé só enquanto o menu do avatar está aberto (nunca com a partida rolando sem menu)
 	Monetization.set_banner_wanted("pause", menu_catcher.visible)
 
@@ -576,9 +625,6 @@ func _exit_tree() -> void:
 func _toggle_menu() -> void:
 	if confirm_root.visible or rival_root.visible or _ending:
 		return
-	for b in menu_social:
-		b.visible = PlayGames.can_show_social()
-	menu_restart.visible = Net.vs_cpu   # reiniciar só existe contra a CPU
 	menu_catcher.visible = not menu_catcher.visible
 	_hide_hint()   # quem abriu o menu já descobriu
 	_update_blocking()
@@ -595,8 +641,6 @@ func _open_confirm() -> void:
 	if _ending:
 		return
 	menu_catcher.visible = false
-	_confirm_restart = false
-	confirm_ok_btn.text = "Sair"
 	if _in_match and not Net.vs_cpu:
 		confirm_msg.text = "Sair agora conta como DERROTA nesta partida online.\nDeseja sair?"
 	else:
@@ -606,39 +650,7 @@ func _open_confirm() -> void:
 
 func _close_confirm() -> void:
 	confirm_root.visible = false
-	_confirm_restart = false
 	_update_blocking()
-
-func _open_restart_confirm() -> void:
-	if _ending or not Net.vs_cpu:
-		return
-	menu_catcher.visible = false
-	_confirm_restart = true
-	confirm_ok_btn.text = "Reiniciar"
-	confirm_msg.text = "Reiniciar a partida?\nO placar volta para 0 x 0."
-	confirm_root.visible = true
-	_update_blocking()
-
-# Botão de confirmar da janela: faz o que foi pedido (reiniciar ou sair)
-func _confirm_ok() -> void:
-	if _confirm_restart:
-		_restart_cpu_match()
-	else:
-		_confirm_exit()
-
-# Contra a CPU: zera o placar e saca de novo, sem sair da partida. Não conta como partida
-# terminada (sem XP, sem anúncio): reiniciar no meio não vale nada.
-func _restart_cpu_match() -> void:
-	_confirm_restart = false
-	confirm_root.visible = false
-	menu_catcher.visible = false
-	if _goal_tween:
-		_goal_tween.kill()
-	goal_panel.visible = false
-	_update_blocking()
-	if _ending or not Net.vs_cpu:
-		return
-	_try_start()   # zera o placar e saca (o placar volta pelo _sync_score)
 
 func _confirm_exit() -> void:
 	if _ending:
@@ -685,9 +697,17 @@ func _layout() -> void:
 	goal_panel.size = Vector2(gw, 100)
 	goal_panel.pivot_offset = goal_panel.size / 2.0   # a animação cresce a partir do centro
 	goal_panel.position = Vector2((vp.x - gw) / 2.0, (vp.y + HEADER_H) / 2.0 - 50.0)
+	x1_btn.size = Vector2(84, 30)
+	x1_btn.pivot_offset = Vector2(42, 15)
+	x1_btn.position = Vector2(8, HEADER_H + 4)
+	tag_mine.size = Vector2(120, 22)
+	tag_mine.position = Vector2(8, HEADER_H + 6)
+	tag_rival.size = Vector2(120, 22)
+	tag_rival.position = Vector2(vp.x - 8 - 120, HEADER_H + 6)
 
 # O aviso central só aparece quando tem texto (senão sobraria uma faixa vazia)
 func _process(delta: float) -> void:
+	_update_rage_hud(delta)
 	if _in_match:
 		_session_play += delta   # tempo de jogo para o pop-up de avaliação
 	info_label.visible = info_label.text != ""
@@ -791,6 +811,7 @@ func _on_net_ended(reason: String) -> void:
 	if _ending:
 		return
 	_ending = true
+	_faceoff.cancel()
 	_flush_play_time()
 	players.process_mode = Node.PROCESS_MODE_DISABLED  # congela tacos e entrada
 	header.visible = false          # <- novo
@@ -820,7 +841,88 @@ func _try_start() -> void:
 			_set_match_active(true)
 		else:
 			_set_match_active.rpc(true)
-		puck.serve()
+		_faceoff.start()   # o X1 decide quem fica com o disco; o saque sai em _on_faceoff_finished
+
+# O X1 acabou (em todos os aparelhos). caller_side = -1: disputa do começo da partida.
+# Senão foi o botão de raiva: a barra de quem chamou zera e o PERDEDOR fica enfraquecido por um tempo.
+func _on_faceoff_finished(winner_side: int, caller_side: int) -> void:
+	if not _in_match:
+		return
+	if caller_side >= 0:
+		rage[caller_side] = 0.0
+		puck.nerf(1 - winner_side, NERF_SECONDS, NERF_POWER)
+	else:
+		_show_hint()
+	GameAudio.whistle_start()   # apito: o disco volta ao jogo
+	if multiplayer.is_server():
+		puck.serve(winner_side)
+
+# ---------------------------------------------------------------- raiva
+
+# Cada gol: quem sofreu enche a barra, quem fez esvazia (roda nos dois aparelhos, via _goal_fx)
+func _rage_on_goal(scorer_side: int) -> void:
+	var conceded := 1 - scorer_side
+	rage[conceded] = minf(1.0, float(rage[conceded]) + RAGE_GAIN)
+	rage[scorer_side] = maxf(0.0, float(rage[scorer_side]) - RAGE_DROP)
+
+# O X1 do botão pode ser chamado? (chamado também pelo FaceOff, no host, para validar o pedido)
+func can_call_x1(side: int) -> bool:
+	if _faceoff == null or _faceoff.is_active():
+		return false
+	return _in_match and not _match_done and not _ending and float(rage[clampi(side, 0, 1)]) >= 0.999
+
+func _on_x1_pressed() -> void:
+	if can_call_x1(my_side):
+		_close_menu()
+		_faceoff.request_x1()
+
+# Etiqueta pequena (texto claro com contorno) para "FRACO 5s" e "X1!"
+func _tag_label(align: int) -> Label:
+	var l := Label.new()
+	l.horizontal_alignment = align as HorizontalAlignment
+	l.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	l.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	l.add_theme_stylebox_override("normal", StyleBoxEmpty.new())
+	l.add_theme_font_size_override("font_size", 14)
+	l.add_theme_color_override("font_color", UIStyle.TEXT_LIGHT)
+	l.add_theme_color_override("font_outline_color", Color.BLACK)
+	l.add_theme_constant_override("outline_size", 4)
+	l.visible = false
+	return l
+
+func _update_rage_hud(delta: float) -> void:
+	var me := clampi(my_side, 0, 1)
+	meter_mine.value = float(rage[me])
+	meter_rival.value = float(rage[1 - me])
+	var show_hud := header.visible and not _ending
+	var can := show_hud and can_call_x1(me)
+	x1_btn.visible = can
+	if can:   # botão pulsa para chamar atenção
+		var k := 1.0 + 0.06 * sin(Time.get_ticks_msec() / 1000.0 * 9.0)
+		x1_btn.scale = Vector2(k, k)
+	# minha etiqueta: só aparece enfraquecido (com o botão visível, ele ocupa o lugar)
+	var my_nerf: float = puck.nerf_left(me)
+	tag_mine.visible = show_hud and not can and my_nerf > 0.0
+	tag_mine.text = "FRACO %ds" % ceili(my_nerf)
+	# etiqueta do rival: "X1!" quando a barra dele está cheia; senão "FRACO"
+	var riv_nerf: float = puck.nerf_left(1 - me)
+	var riv_ready := float(rage[1 - me]) >= 0.999 and _in_match and not _match_done
+	tag_rival.visible = show_hud and (riv_ready or riv_nerf > 0.0)
+	if riv_ready:
+		tag_rival.text = "X1!"
+		tag_rival.add_theme_color_override("font_color", Color("ffcf5c") if int(Time.get_ticks_msec() / 250) % 2 == 0 else Color("ff6a2a"))
+	else:
+		tag_rival.text = "FRACO %ds" % ceili(riv_nerf)
+		tag_rival.add_theme_color_override("font_color", UIStyle.TEXT_LIGHT)
+	# CPU (Normal/Difícil) também usa o X1 quando a barra dela enche
+	if Net.vs_cpu and _in_match and not _match_done and Net.cpu_level >= 1 and not _faceoff.is_active():
+		if float(rage[1 - me]) >= 0.999:
+			_cpu_x1_wait += delta
+			if _cpu_x1_wait >= CPU_X1_DELAY:
+				_cpu_x1_wait = 0.0
+				_faceoff.call_x1(1 - me)
+		else:
+			_cpu_x1_wait = 0.0
 
 func _on_wall_hit(impact: float) -> void:
 	if _in_match:
@@ -830,7 +932,7 @@ func _on_paddle_hit(impact: float, mine: bool) -> void:
 	if _in_match:
 		GameAudio.hit(impact, mine)   # som do taco + vibração sutil (só no meu taco)
 
-func _on_goal(scorer_side: int) -> void:
+func _on_goal(scorer_side: int, info: int = 0) -> void:
 	scores[scorer_side] += 1
 	_sync_score()
 	if Net.vs_cpu:
@@ -843,6 +945,7 @@ func _on_goal(scorer_side: int) -> void:
 # Em cada aparelho: painel GOL!, torcida e vibração forte
 @rpc("authority", "call_local", "reliable")
 func _goal_fx(_scorer_side: int) -> void:
+	_rage_on_goal(_scorer_side)
 	GameAudio.goal()
 	if _goal_tween:
 		_goal_tween.kill()
@@ -864,18 +967,17 @@ func _set_score(a: int, b: int) -> void:
 
 @rpc("authority", "call_local", "reliable")
 func _set_match_active(active: bool) -> void:
-	var started := active and not _in_match
 	_in_match = active
 	_match_done = false      # nova partida (ou rival saiu): o menu de fim não vale mais
 	_rematch_votes = []
+	rage = [0.0, 0.0]
+	_cpu_x1_wait = 0.0
 	end_root.visible = false
 	_update_blocking()
 	header.visible = active
 	GameAudio.set_in_match(active)
-	if started:
-		_show_hint()
-		GameAudio.whistle_start()   # apito de início
 	if not active:
+		_faceoff.cancel()   # rival saiu no meio do X1
 		_flush_play_time()
 		_hide_hint()
 		if _goal_tween:
